@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 
 import torchtext
 from torchtext.datasets import TranslationDataset, Multi30k
@@ -10,61 +11,98 @@ import random
 import math
 import time
 
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_seq_length, dropout=0.2):
+        super().__init__()
+
+        pe = torch.zeros(max_seq_length, d_model)
+        position = torch.arange(0, max_seq_length, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model))
+
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        self.register_buffer('pe', pe.unsqueeze(0))
+
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, x):
+        return self.dropout(x + self.pe[:, :x.size(1)])
+
+class Attention(nn.Module):
+    def __init__(self, hidden_size):
+        super(Attention, self).__init__()
+        self.attn = nn.Linear(hidden_size * 2, hidden_size)
+        self.v = nn.Parameter(torch.rand(hidden_size))
+        stdv = 1. / math.sqrt(self.v.size(0))
+        self.v.data.uniform_(-stdv, stdv)
+        
+    def forward(self, hidden, encoder_outputs):
+        timestep = encoder_outputs.shape[0]
+        h = hidden.repeat(timestep, 1, 1).transpose(0, 1)
+        encoder_outputs = encoder_outputs.transpose(0, 1)
+        
+        attn_energies = self.score(h, encoder_outputs)
+        return F.softmax(attn_energies, dim=1).unsqueeze(1)
+         
+    def score(self, hidden, encoder_outputs):
+        energy = torch.tanh(self.attn(torch.cat([hidden, encoder_outputs], 2)))
+        energy = energy.transpose(1, 2)
+        v = self.v.repeat(encoder_outputs.size(0), 1).unsqueeze(1)
+        energy = torch.bmm(v, energy)
+        return energy.squeeze(1)
 
 class Encoder(nn.Module):
-    def __init__(self, input_dim, emb_dim, hid_dim, n_layers, dropout):
+    def __init__(self, input_dim, emb_dim, hid_dim, n_layers, dropout : float, posEnc : bool = False, attention: bool = False):
         super().__init__()
         
         self.input_dim = input_dim
         self.emb_dim = emb_dim
         self.hid_dim = hid_dim
         self.n_layers = n_layers
-#         self.dropout = dropout
         
+        self.posEnc = None
+        if posEnc:
+            self.posEnc = PositionalEncoding(emb_dim, 256, dropout)
+
+        self.attention = None
+
         self.embedding = nn.Embedding(
             num_embeddings=input_dim,
             embedding_dim=emb_dim
         )
             # <YOUR CODE HERE>
         
-        self.rnn = nn.LSTM(
+        self.rnn = nn.GRU(
             input_size=emb_dim,
             hidden_size=hid_dim,
             num_layers=n_layers,
-            dropout=dropout
+            dropout=(0 if n_layers == 1 else dropout),
+            bidirectional=True
         )
             # <YOUR CODE HERE>
         
         self.dropout = nn.Dropout(p=dropout)# <YOUR CODE HERE>
         
-    def forward(self, src):
+    def forward(self, src, hidden=None):
         
-        #src = [src sent len, batch size]
+        embedded = self.dropout(self.embedding(src))
+
+        if not hidden:
+            hidden = torch.randn(2 * self.n_layers, src.shape[-1], self.hid_dim)
+            if torch.cuda.is_available():
+                hidden = hidden.cuda()
+
+        output, hidden = self.rnn(embedded, hidden)
+        output = output[:, :, :self.hid_dim] + output[:, :, self.hid_dim:]
+
+        hidden = torch.tanh(hidden)
         
-        # Compute an embedding from the src data and apply dropout to it
-        embedded = self.embedding(src)# <YOUR CODE HERE>
-        
-        embedded = self.dropout(embedded)
-        
-        output, (hidden, cell) = self.rnn(embedded)
-        #embedded = [src sent len, batch size, emb dim]
-        
-        # Compute the RNN output values of the encoder RNN. 
-        # outputs, hidden and cell should be initialized here. Refer to nn.LSTM docs ;)
-        
-        # <YOUR CODE HERE> 
-        
-        #outputs = [src sent len, batch size, hid dim * n directions]
-        #hidden = [n layers * n directions, batch size, hid dim]
-        #cell = [n layers * n directions, batch size, hid dim]
-        
-        #outputs are always from the top hidden layer
-        
-        return hidden, cell
+        return output, hidden
     
 
 class Decoder(nn.Module):
-    def __init__(self, output_dim, emb_dim, hid_dim, n_layers, dropout):
+    def __init__(self, output_dim, emb_dim, hid_dim, n_layers, dropout : float, posEnc : bool = False, attention: bool = False):
         super().__init__()
 
         self.emb_dim = emb_dim
@@ -73,17 +111,24 @@ class Decoder(nn.Module):
         self.n_layers = n_layers
         self.dropout = dropout
         
+        self.attention = None
+        self.posEnc = None
+        if attention:
+            self.attention1 = Attention(hid_dim)
+
+            if posEnc:
+                self.posEnc = PositionalEncoding(hid_dim, 256, dropout)
+
         self.embedding = nn.Embedding(
             num_embeddings=output_dim,
             embedding_dim=emb_dim
         )
-            # <YOUR CODE HERE>
         
-        self.rnn = nn.LSTM(
-            input_size=emb_dim,
+        self.rnn = nn.GRU(
+            input_size=emb_dim if self.attention is None else hid_dim + emb_dim,
             hidden_size=hid_dim,
             num_layers=n_layers,
-            dropout=dropout
+            dropout=(0 if n_layers == 1 else dropout)
         )
             # <YOUR CODE HERE>
         
@@ -95,46 +140,27 @@ class Decoder(nn.Module):
         
         self.dropout = nn.Dropout(p=dropout)# <YOUR CODE HERE>
         
-    def forward(self, input, hidden, cell):
+    def forward(self, input, hidden, encoder_outputs):
+        embedded = self.dropout(self.embedding(input).unsqueeze(0))
+        if self.posEnc is not None:
+            encoder_outputs = self.posEnc(encoder_outputs)
+
+        rnn_input = embedded
         
-        #input = [batch size]
-        #hidden = [n layers * n directions, batch size, hid dim]
-        #cell = [n layers * n directions, batch size, hid dim]
+        if self.attention is not None:
+            key = hidden.sum(axis=0)
+            attn_weights = self.attention(key, encoder_outputs)
+            context = attn_weights.bmm(encoder_outputs.transpose(0, 1))
+            context = context.transpose(0, 1)
+            rnn_input = torch.cat([embedded, context], -1)
+
+        output, hidden = self.rnn(rnn_input, hidden)
+        output = output.squeeze(0)
+
+        output = self.out(output)
+        output = F.log_softmax(output, dim=1)
         
-        #n directions in the decoder will both always be 1, therefore:
-        #hidden = [n layers, batch size, hid dim]
-        #context = [n layers, batch size, hid dim]
-        
-        input = input.unsqueeze(0)
-        
-        #input = [1, batch size]
-        
-        # Compute an embedding from the input data and apply dropout to it
-        embedded = self.dropout(self.embedding(input))# <YOUR CODE HERE>
-        
-        #embedded = [1, batch size, emb dim]
-        
-        # Compute the RNN output values of the encoder RNN. 
-        # outputs, hidden and cell should be initialized here. Refer to nn.LSTM docs ;)
-        # <YOUR CODE HERE>
-        
-        
-        #output = [sent len, batch size, hid dim * n directions]
-        #hidden = [n layers * n directions, batch size, hid dim]
-        #cell = [n layers * n directions, batch size, hid dim]
-        
-        #sent len and n directions will always be 1 in the decoder, therefore:
-        #output = [1, batch size, hid dim]
-        #hidden = [n layers, batch size, hid dim]
-        #cell = [n layers, batch size, hid dim]
-        
-        
-        output, (hidden, cell) = self.rnn(embedded, (hidden, cell))
-        prediction = self.out(output.squeeze(0))
-        
-        #prediction = [batch size, output dim]
-        
-        return prediction, hidden, cell
+        return output, hidden
 
 
 class Seq2Seq(nn.Module):
@@ -152,28 +178,19 @@ class Seq2Seq(nn.Module):
         
     def forward(self, src, trg, teacher_forcing_ratio = 0.5):
         
-        #src = [src sent len, batch size]
-        #trg = [trg sent len, batch size]
-        #teacher_forcing_ratio is probability to use teacher forcing
-        #e.g. if teacher_forcing_ratio is 0.75 we use ground-truth inputs 75% of the time
-        
-        # Again, now batch is the first dimention instead of zero
         batch_size = trg.shape[1]
         max_len = trg.shape[0]
         trg_vocab_size = self.decoder.output_dim
         
-        #tensor to store decoder outputs
         outputs = torch.zeros(max_len, batch_size, trg_vocab_size).to(self.device)
         
-        #last hidden state of the encoder is used as the initial hidden state of the decoder
-        hidden, cell = self.encoder(src)
-        
-        #first input to the decoder is the <sos> tokens
+        encoder_output, hidden = self.encoder(src)
+        hidden = hidden[-self.decoder.n_layers:]
         input = trg[0,:]
         
         for t in range(1, max_len):
             
-            output, hidden, cell = self.decoder(input, hidden, cell)
+            output, hidden = self.decoder(input, hidden, encoder_output)
             outputs[t] = output
             teacher_force = random.random() < teacher_forcing_ratio
             top1 = output.max(1)[1]
