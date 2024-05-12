@@ -28,12 +28,15 @@ def play_and_log_episode(env, agent, gamma=0.99, t_max=10000):
     v_agent = []
     q_spreads = []
     td_errors = []
+    q_values_arr = []
+    actions = []
     rewards = []
 
     s, _ = env.reset()
     for step in range(t_max):
         states.append(s)
         qvalues = agent.get_qvalues([s])
+        q_values_arr.append(qvalues)
         max_q_value, min_q_value = np.max(qvalues), np.min(qvalues)
         v_agent.append(max_q_value)
         q_spreads.append(max_q_value - min_q_value)
@@ -42,6 +45,7 @@ def play_and_log_episode(env, agent, gamma=0.99, t_max=10000):
                 np.abs(rewards[-1] + gamma * v_agent[-1] - v_agent[-2]))
 
         action = qvalues.argmax(axis=-1)[0]
+        actions.append(action)
 
         s, r, done, *_ = env.step(action)
         rewards.append(r)
@@ -53,6 +57,8 @@ def play_and_log_episode(env, agent, gamma=0.99, t_max=10000):
 
     return_pack = {
         'states': np.array(states),
+        'qvalues': np.array(q_values_arr),
+        "actions": np.array(actions),
         'v_mc': np.array(v_mc),
         'v_agent': np.array(v_agent),
         'q_spreads': np.array(q_spreads),
